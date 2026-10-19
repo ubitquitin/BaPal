@@ -66,10 +66,11 @@ local splits = {
 }
 
 local roleNames = {
-    [0] = "Attacker",
-    [1] = "Defender",
-    [2] = "Collector",
-    [3] = "Healer"
+    [0] = "No Role Set",
+    [1] = "Attacker",
+    [2] = "Defender",
+    [3] = "Collector",
+    [4] = "Healer"
 }
 
 -- =====================================
