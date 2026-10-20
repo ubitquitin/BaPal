@@ -39,6 +39,9 @@ local VAR = {
     WAVE = -22919,
     ROUND_TIME = 4690,
     ROLE = 1494,
+    KING_KILL_CURRENCY = -22920,
+    QUEEN_KILL_CURRENCY = -4509,
+    REWARD_TYPE = -4537,
 
     CURRENT_ATTACKER = -4519,
     CURRENT_DEFENDER = -4527,
@@ -81,6 +84,8 @@ local SECONDS_PER_TIMER_UNIT = 0.6
 local state = {
     tick = 0,
     serverTick = 0, -- Monotonic tick counter, including time between waves
+    waveStartTick = nil,
+    waveElapsedTicks = nil,
 
     currentMode = nil,
     currentWave = nil,
@@ -233,8 +238,32 @@ local tickStatusLabel = tickPage:AddText({
 })
 
 local timerLabel = tickPage:AddText({
-    text = "Round timer: --"
+    text = "Wave time (ticks): --"
 })
+
+local callChangeLabel = tickPage:AddText({
+    text = "Call change in: --"
+})
+
+-- Exactly 50 game ticks = 30 seconds per call cycle.
+local CALL_CHANGE_TICKS = 50
+local SECONDS_PER_GAME_TICK = 0.6
+
+local function updateWaveTimers()
+    if state.inWave and state.waveStartTick ~= nil then
+        local elapsed = math.max(0, state.serverTick - state.waveStartTick)
+        state.waveElapsedTicks = elapsed
+        timerLabel.content = "Wave time (ticks): " .. tostring(elapsed)
+
+        local remainingTicks = CALL_CHANGE_TICKS - (elapsed % CALL_CHANGE_TICKS)
+        local remainingSeconds = remainingTicks * SECONDS_PER_GAME_TICK
+        callChangeLabel.content = string.format("Call change in: %.1fs", remainingSeconds)
+    else
+        timerLabel.content = "Wave time (ticks): " ..
+            tostring(state.waveElapsedTicks ~= nil and state.waveElapsedTicks or "--")
+        callChangeLabel.content = "Call change in: --"
+    end
+end
 
 local tickWaveLabel = tickPage:AddText({
     text = "Wave: --"
@@ -283,6 +312,17 @@ local kingFoodLabel = kingPage:AddText({
     text = "--",
     height = 45
 })
+
+kingPage:AddTitle("Stored BA kills")
+local kingKillsLabel = kingPage:AddText({ text = "King kills: -- / 20" })
+local queenKillsLabel = kingPage:AddText({ text = "Queen kills: -- / 1" })
+
+local function updateStoredKills()
+    local kingKills = vp(VAR.KING_KILL_CURRENCY)
+    local queenKills = vp(VAR.QUEEN_KILL_CURRENCY)
+    kingKillsLabel.content = "King kills: " .. tostring(kingKills ~= nil and kingKills or "--") .. " / 20"
+    queenKillsLabel.content = "Queen kills: " .. tostring(queenKills ~= nil and queenKills or "--") .. " / 1"
+end
 
 local function resetKing()
     state.kingActive = false
@@ -372,6 +412,10 @@ local roleLabel = ba_app:AddText({
     text = "Role: --"
 })
 
+local rewardTypeLabel = ba_app:AddText({
+    text = "Reward Type: --"
+})
+
 ba_app:AddText({
     text = "Current Points",
     colour = 0xE8BD83FF
@@ -432,6 +476,13 @@ end
 
 local function updatePlayerInfo()
     local role = vp(VAR.ROLE)
+    local rewardType = vp(VAR.REWARD_TYPE)
+    
+    rewardTypeLabel.content = "Reward Type: " .. (
+        rewardType == 0 and "Points"
+        or rewardType == 1 and "BXP"
+        or "Unknown"
+    )
 
     roleLabel.content =
         "Role: " .. (
@@ -468,6 +519,9 @@ local function resetRun()
     state.activeWave = nil
     state.activeMode = nil
     state.tick = 0
+    state.waveStartTick = nil
+    state.waveElapsedTicks = nil
+    updateWaveTimers()
     state.quickstartStartTick = nil
     state.quickstartTargetWave = nil
     state.quickstartMode = nil
@@ -524,6 +578,9 @@ local function startWaveFromRegion()
     state.activeWave = waveValue
     state.activeMode = mode
     state.tick = 0
+    state.waveStartTick = state.serverTick
+    state.waveElapsedTicks = 0
+    updateWaveTimers()
     tickLabel.content = "0"
     tickStatusLabel.content = "Status: In wave"
 
@@ -536,9 +593,6 @@ updateGameState = function()
     local modeValue = vp(VAR.MODE)
     local waveValue = vp(VAR.WAVE)
     local timerValue = vp(VAR.ROUND_TIME)
-
-    timerLabel.content = "Round timer (raw): " ..
-        tostring(timerValue ~= nil and timerValue or "--")
 
     local newMode = modeValue == 0 and "normal"
         or modeValue == 1 and "hard" or nil
@@ -594,7 +648,13 @@ updateGameState = function()
                 state.quickstartMode = nil
             end
 
+            -- Freeze the completed wave's elapsed time until the next entry.
+            if state.waveStartTick ~= nil then
+                state.waveElapsedTicks = math.max(0, state.serverTick - state.waveStartTick)
+            end
+            state.waveStartTick = nil
             state.inWave = false
+            updateWaveTimers()
             state.activeWave = nil
             state.activeMode = nil
             state.tick = 0
@@ -624,6 +684,13 @@ Event.ServerLogic.Subscribe(
         -- Detect wave completion before advancing the display counter.
         updateGameState()
         updateKing()
+        updateWaveTimers()
+        updateStoredKills()
+
+        --DEBUG
+        print('BARBASSAULT_COLLECTOR_USED ' .. vp(4683))
+        print('BARBASSAULT_KING_PLAYER ' .. vp(4684))
+
         if state.inWave then
             tickLabel.content = tostring(state.tick)
             state.tick = (state.tick + 1) % 10
@@ -650,6 +717,8 @@ Event.RegionCreated.Subscribe(
 refreshSplits()
 resetKing()
 updateGameState()
+updateWaveTimers()
+updateStoredKills()
 updatePlayerInfo()
 
 ba_app:RefreshRowBackgrounds()

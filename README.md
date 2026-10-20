@@ -28,7 +28,6 @@ The script currently relies on `Event.ServerLogic` and several varplayer IDs. Th
 | `4690` | `BARBASSAULT_ROUNDTIME` |
 | `1494` | Current player role |
 | `1495`–`1498` | Attacker, Defender, Collector, and Healer points |
-| `1499`–`1502` | Teammate player UIDs |
 
 **Important:** The precise timer units, flag-transition semantics, and UID-to-player-name mapping still need to be confirmed in-game. The supplied flag list also lacks a normal-mode wave 1 flag.
 
