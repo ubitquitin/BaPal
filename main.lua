@@ -34,14 +34,6 @@ local function vp(id)
     return ok and value or nil
 end
 
-local function vc(id)
-    local ok, value = pcall(function()
-        local config = var.VarClient.FromID(id)
-        return config and config.value or nil
-    end)
-    return ok and value or nil
-end
-
 local VAR = {
     MODE = 4688,
     WAVE = -22919,
@@ -57,10 +49,6 @@ local VAR = {
     HIGHSCORE_DEFENDER = 1496,
     HIGHSCORE_COLLECTOR = 1497,
     HIGHSCORE_HEALER = 1498
-}
-
-local TEAM_NAME_IDS = {
-    2435, 2436, 2437, 2438, 2439
 }
 
 local ROLE_NAMES = {
@@ -92,18 +80,24 @@ local SECONDS_PER_TIMER_UNIT = 0.6
 
 local state = {
     tick = 0,
+    serverTick = 0, -- Monotonic tick counter, including time between waves
 
     currentMode = nil,
     currentWave = nil,
-
-    previousMode = nil,
-    previousWave = nil,
     previousTimer = nil,
 
-    splits = {
-        normal = {},
-        hard = {}
-    }
+    -- Only a RegionCreated event starts an active wave.
+    inWave = false,
+    activeWave = nil,
+    activeMode = nil,
+
+    -- Set at wave increment, consumed at the next RegionCreated.
+    quickstartStartTick = nil,
+    quickstartTargetWave = nil,
+    quickstartMode = nil,
+
+    splits = { normal = {}, hard = {} },
+    quickstarts = { normal = {}, hard = {} }
 }
 
 -- ============================================
@@ -135,7 +129,7 @@ local waveLabel = splitPage:AddText({
 })
 
 splitPage:AddText({
-    text = "WAVE          TIME",
+    text = "WAVE       TIME       QUICKSTART",
     colour = 0xE8BD83FF
 })
 
@@ -144,7 +138,7 @@ local splitRows = {}
 for wave = 1, 9 do
     splitRows[wave] = splitPage:AddText({
         text = string.format(
-            "Wave %d     --:--",
+            "Wave %d       --:--       --",
             wave
         ),
         height = 20
@@ -170,26 +164,23 @@ end
 local function refreshSplits()
     local mode = state.currentMode
 
-    modeLabel.content =
-        "Mode: " .. (
-            mode == "hard" and "Hard"
-            or mode == "normal" and "Normal"
-            or "--"
-        )
+    modeLabel.content = "Mode: " .. (
+        mode == "hard" and "Hard"
+        or mode == "normal" and "Normal"
+        or "--"
+    )
 
-    waveLabel.content =
-        "Current Wave: " ..
+    waveLabel.content = "Current Wave: " ..
         tostring(state.currentWave or "--")
 
     for wave = 1, 9 do
-        local time = mode
-            and state.splits[mode][wave]
-            or nil
-
+        local split = mode and state.splits[mode][wave] or nil
+        local quickstart = mode and state.quickstarts[mode][wave] or nil
         splitRows[wave].content = string.format(
-            "Wave %d     %s",
+            "Wave %d       %s       %s",
             wave,
-            formatTime(time)
+            formatTime(split),
+            quickstart ~= nil and (tostring(quickstart) .. " ticks") or "--"
         )
     end
 end
@@ -201,12 +192,16 @@ end
 tickPage:AddTitle("Current Tick")
 
 local tickLabel = tickPage:AddText({
-    text = "0",
+    text = "--",
     colour = 0xE8BD83FF,
     height = 50
 })
 
-tickPage:AddText("Repeats every 10 server ticks")
+tickPage:AddText("Repeats every 10 server ticks (during wave only)")
+
+local tickStatusLabel = tickPage:AddText({
+    text = "Status: Waiting for wave"
+})
 
 local timerLabel = tickPage:AddText({
     text = "Round timer: --"
@@ -252,16 +247,6 @@ ba_app:AddText({
 local highscorePointsLabel = ba_app:AddText({
     text = "A: --  D: --  C: --  H: --",
     height = 24
-})
-
-ba_app:AddText({
-    text = "Team",
-    colour = 0xE8BD83FF
-})
-
-local teammatesLabel = ba_app:AddText({
-    text = "Teammates: --",
-    height = 40
 })
 
 -- ============================================
@@ -325,135 +310,152 @@ local function updatePlayerInfo()
         vp(VAR.HIGHSCORE_HEALER)
     )
 
-    local names = {}
-    local seen = {}
 
-    for _, id in ipairs(TEAM_NAME_IDS) do
-        local name = vc(id)
-
-        if type(name) == "string" then
-            name = name:match("^%s*(.-)%s*$")
-
-            if name ~= "" and not seen[name] then
-                names[#names + 1] = name
-                seen[name] = true
-            end
-        end
-    end
-
-    teammatesLabel.content =
-        "Team: " .. (
-            #names > 0
-            and table.concat(names, ", ")
-            or "--"
-        )
 end
 
 -- ============================================
 -- Game State / Wave Tracking
 -- ============================================
 
-local function updateGameState()
+local function resetRun()
+    state.splits = { normal = {}, hard = {} }
+    state.quickstarts = { normal = {}, hard = {} }
+    state.inWave = false
+    state.activeWave = nil
+    state.activeMode = nil
+    state.tick = 0
+    state.quickstartStartTick = nil
+    state.quickstartTargetWave = nil
+    state.quickstartMode = nil
+    tickLabel.content = "--"
+    tickStatusLabel.content = "Status: Waiting for wave"
+end
+
+local updateGameState -- Forward declaration for RegionCreated callback
+
+-- Called by RegionCreated; this is the ONLY way to start a wave.
+local function startWaveFromRegion()
+    local modeValue = vp(VAR.MODE)
+    local waveValue = vp(VAR.WAVE)
+    local mode = modeValue == 0 and "normal"
+        or modeValue == 1 and "hard" or nil
+
+    if not mode or type(waveValue) ~= "number"
+        or waveValue < 1 or waveValue > 9 then
+        print("BA RegionCreated: ignored (no valid BA mode/wave)")
+        return
+    end
+
+    -- Reconcile any wave transition not yet observed by ServerLogic.
+    updateGameState()
+
+    state.currentMode = mode
+    state.currentWave = waveValue
+
+    -- Avoid restarting the tick counter on repeated region events.
+    if state.inWave then
+        print("BA RegionCreated: already in wave; ignored")
+        return
+    end
+
+    if state.quickstartStartTick ~= nil
+        and state.quickstartTargetWave == waveValue
+        and state.quickstartMode == mode then
+        state.quickstarts[mode][waveValue] =
+            state.serverTick - state.quickstartStartTick
+        print(string.format("BA quickstart: wave=%d ticks=%d",
+            waveValue, state.quickstarts[mode][waveValue]))
+    end
+
+    state.quickstartStartTick = nil
+    state.quickstartTargetWave = nil
+    state.quickstartMode = nil
+    state.inWave = true
+    state.activeWave = waveValue
+    state.activeMode = mode
+    state.tick = 0
+    tickLabel.content = "0"
+    tickStatusLabel.content = "Status: In wave"
+
+    print(string.format("BA wave started (RegionCreated): %s wave %d",
+        mode, waveValue))
+    refreshSplits()
+end
+
+updateGameState = function()
     local modeValue = vp(VAR.MODE)
     local waveValue = vp(VAR.WAVE)
     local timerValue = vp(VAR.ROUND_TIME)
 
-    -- Update raw timer independently.
-    timerLabel.content =
-        "Round timer (raw): " ..
-        tostring(timerValue or "--")
+    timerLabel.content = "Round timer (raw): " ..
+        tostring(timerValue ~= nil and timerValue or "--")
 
-    if modeValue == nil or waveValue == nil then
+    local newMode = modeValue == 0 and "normal"
+        or modeValue == 1 and "hard" or nil
+
+    if not newMode or type(waveValue) ~= "number" then
         return
     end
 
-    local newMode = nil
-
-    if modeValue == 0 then
-        newMode = "normal"
-    elseif modeValue == 1 then
-        newMode = "hard"
-    end
-
-    if newMode == nil then
-        return
-    end
-
-    local modeChanged =
-        newMode ~= state.currentMode
-
-    local waveChanged =
-        waveValue ~= state.currentWave
-
-    -- Initial observation: do not record a split.
     if state.currentWave == nil then
         state.currentMode = newMode
         state.currentWave = waveValue
         state.previousTimer = timerValue
-
         refreshSplits()
-        return
-    end
-
-    -- Detect wave transitions.
-    if waveChanged then
+    else
         local oldWave = state.currentWave
         local oldMode = state.currentMode
 
-        print(string.format(
-            "BA wave transition: %s -> %s",
-            tostring(oldWave),
-            tostring(waveValue)
-        ))
+        if waveValue < oldWave or newMode ~= oldMode then
+            print(string.format("BA run reset: %s wave %s -> %s wave %s",
+                tostring(oldMode), tostring(oldWave), newMode,
+                tostring(waveValue)))
+            resetRun()
+        elseif waveValue > oldWave then
+            print(string.format("BA wave transition: %d -> %d",
+                oldWave, waveValue))
 
-        -- A sequential increment is a candidate
-        -- completed-wave event.
-        --
-        -- Note: ticket skips may also increment
-        -- the wave number, so this needs validation.
-        if waveValue == oldWave + 1
-            and oldWave >= 1
-            and oldWave <= 9
-            and oldMode == newMode then
+            -- Only record a split if RegionCreated actually started
+            -- the completed wave, and this is a sequential increment.
+            if state.inWave and state.activeWave == oldWave
+                and state.activeMode == oldMode
+                and waveValue == oldWave + 1 then
+                local completedTime = SPLIT_TIMER_SOURCE == "previous"
+                    and state.previousTimer or timerValue
+                if completedTime ~= nil then
+                    state.splits[oldMode][oldWave] = completedTime
+                    print(string.format("BA split: %s wave=%d time=%s",
+                        oldMode, oldWave, tostring(completedTime)))
+                end
 
-            local completedTime = nil
-
-            if SPLIT_TIMER_SOURCE == "previous" then
-                completedTime = state.previousTimer
+                -- The next wave's quickstart begins NOW, at increment.
+                state.quickstartStartTick = state.serverTick
+                state.quickstartTargetWave = waveValue
+                state.quickstartMode = newMode
             else
-                completedTime = timerValue
+                -- Skip / missed start: no trustworthy quickstart origin.
+                state.quickstartStartTick = nil
+                state.quickstartTargetWave = nil
+                state.quickstartMode = nil
             end
 
-            if completedTime ~= nil then
-                state.splits[oldMode][oldWave] =
-                    completedTime
-
-                print(string.format(
-                    "BA split: mode=%s wave=%d time=%s",
-                    oldMode,
-                    oldWave,
-                    tostring(completedTime)
-                ))
-            end
+            state.inWave = false
+            state.activeWave = nil
+            state.activeMode = nil
+            state.tick = 0
+            tickLabel.content = "--"
+            tickStatusLabel.content = "Status: Between waves"
         end
-    end
 
-    state.currentMode = newMode
-    state.currentWave = waveValue
-    state.previousTimer = timerValue
-
-    if modeChanged or waveChanged then
+        state.currentMode = newMode
+        state.currentWave = waveValue
         refreshSplits()
     end
 
-    tickWaveLabel.content =
-        "Wave: " .. tostring(waveValue)
-
-    tickModeLabel.content =
-        "Mode: " .. (
-            newMode == "hard" and "Hard"
-            or "Normal"
-        )
+    state.previousTimer = timerValue
+    tickWaveLabel.content = "Wave: " .. tostring(waveValue)
+    tickModeLabel.content = "Mode: " ..
+        (newMode == "hard" and "Hard" or "Normal")
 end
 
 -- ============================================
@@ -463,11 +465,25 @@ end
 Event.ServerLogic.Subscribe(
     "serverLogicEvent",
     function()
-        tickLabel.content = tostring(state.tick)
-        state.tick = (state.tick + 1) % 10
-
+        state.serverTick = state.serverTick + 1
+        -- Detect wave completion before advancing the display counter.
         updateGameState()
+        if state.inWave then
+            tickLabel.content = tostring(state.tick)
+            state.tick = (state.tick + 1) % 10
+        else
+            tickLabel.content = "--"
+        end
+
         updatePlayerInfo()
+    end
+)
+
+-- A region transition is our authoritative wave-start signal.
+Event.RegionCreated.Subscribe(
+    "baRegionCreated",
+    function(event)
+        startWaveFromRegion()
     end
 )
 
@@ -488,6 +504,10 @@ ba_app:RefreshRowBackgrounds()
 function PluginShutdown()
     Event.ServerLogic.Unsubscribe(
         "serverLogicEvent"
+    )
+
+    Event.RegionCreated.Unsubscribe(
+        "baRegionCreated"
     )
 
     ba_app:Destroy()
