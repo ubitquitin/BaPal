@@ -11,9 +11,9 @@ local ba_app = prettyui.Window.new(parent, {
     title = "BA Pal",
     x = 149,
     y = 336,
-    width = 440,
-    height = 510,
-    minWidth = 340,
+    width = 550,
+    height = 650,
+    minWidth = 510,
     minHeight = 350,
     rowBackgroundColours = {
         0x24211EFF,
@@ -97,7 +97,12 @@ local state = {
     quickstartMode = nil,
 
     splits = { normal = {}, hard = {} },
-    quickstarts = { normal = {}, hard = {} }
+    quickstarts = { normal = {}, hard = {} },
+
+    kingActive = false,
+    kingStartTick = nil,
+    kingSpawnDetected = false,
+    kingFoodStartTick = nil
 }
 
 -- ============================================
@@ -106,14 +111,16 @@ local state = {
 
 local tabs = ba_app:AddTabs({
     { text = "Wave Splits" },
-    { text = "Wave Tick" }
+    { text = "Wave Tick" },
+    { text = "Penance King" }
 }, {
-    height = 265,
+    height = 365,
     activeIndex = 1
 })
 
 local splitPage = tabs:GetPage(1)
 local tickPage = tabs:GetPage(2)
+local kingPage = tabs:GetPage(3)
 
 -- ============================================
 -- Wave Splits UI
@@ -128,22 +135,37 @@ local waveLabel = splitPage:AddText({
     text = "Current Wave: --"
 })
 
-splitPage:AddText({
-    text = "WAVE       TIME       QUICKSTART",
-    colour = 0xE8BD83FF
-})
-
-local splitRows = {}
-
-for wave = 1, 9 do
-    splitRows[wave] = splitPage:AddText({
-        text = string.format(
-            "Wave %d       --:--       --",
-            wave
-        ),
-        height = 20
+-- Fixed-width inline columns avoid spacing drift with proportional fonts.
+local function splitCell(text, width, colour, first)
+    return splitPage:AddText({
+        text = text,
+        width = width,
+        height = 22,
+        inline = not first,
+        columnGap = 4,
+        colour = colour,
+        marginTop = 0,
+        marginBottom = 0
     })
 end
+
+splitCell("WAVE", 115, 0xE8BD83FF, true)
+splitCell("TIME", 90, 0xE8BD83FF, false)
+splitCell("QUICKSTART", 140, 0xE8BD83FF, false)
+
+local splitRows = {}
+for wave = 1, 9 do
+    splitCell("Wave " .. wave, 115, nil, true)
+    local timeCell = splitCell("--:--", 90, nil, false)
+    local quickCell = splitCell("--", 140, nil, false)
+    splitRows[wave] = { time = timeCell, quick = quickCell }
+end
+
+local totalLabel = splitPage:AddText({
+    text = "Total (1-9): --:--",
+    colour = 0xE8BD83FF,
+    marginTop = 10
+})
 
 local function formatTime(raw)
     if raw == nil then
@@ -173,16 +195,23 @@ local function refreshSplits()
     waveLabel.content = "Current Wave: " ..
         tostring(state.currentWave or "--")
 
+    local totalTicks = 0
+    local complete = mode ~= nil
     for wave = 1, 9 do
         local split = mode and state.splits[mode][wave] or nil
-        local quickstart = mode and state.quickstarts[mode][wave] or nil
-        splitRows[wave].content = string.format(
-            "Wave %d       %s       %s",
-            wave,
-            formatTime(split),
-            quickstart ~= nil and (tostring(quickstart) .. " ticks") or "--"
-        )
+        -- Quickstart belongs to the wave being exited, not the next wave.
+        local quickstart = (mode and wave < 9)
+            and state.quickstarts[mode][wave] or nil
+        splitRows[wave].time.content = formatTime(split)
+        splitRows[wave].quick.content = wave == 9 and "--"
+            or quickstart ~= nil and (tostring(quickstart) .. " ticks") or "--"
+        if split == nil or (wave < 9 and quickstart == nil) then
+            complete = false
+        else
+            totalTicks = totalTicks + split + (quickstart or 0)
+        end
     end
+    totalLabel.content = "Total (1-9): " .. (complete and formatTime(totalTicks) or "--:--")
 end
 
 -- ============================================
@@ -214,6 +243,120 @@ local tickWaveLabel = tickPage:AddText({
 local tickModeLabel = tickPage:AddText({
     text = "Mode: --"
 })
+
+-- ============================================
+-- Penance King UI and timing
+-- ============================================
+
+local KING_NPC_ID = 19670
+local KING_SPAWN_TICKS = 600  -- 6 minutes at 600 ms per server tick
+local KING_FOOD_TICKS = 36
+local KING_POLL_BELOW_TICKS = 9 -- strictly below 5 seconds
+local KING_GREEN = 0x44DD66FF
+local KING_YELLOW = 0xFFE04AFF
+local KING_RED = 0xFF5555FF
+
+kingPage:AddTitle("Time till spawn")
+-- Three fixed-size, inline labels share one visual row. Only the active
+-- colour label contains text. Native ui.Text.height is read-only, so do not
+-- attempt to resize or hide labels by assigning to .height.
+local kingSpawnLabels = {
+    green = kingPage:AddText({ text = "06:00", colour = KING_GREEN,
+        width = 105, height = 42, marginBottom = 0 }),
+    yellow = kingPage:AddText({ text = "", colour = KING_YELLOW,
+        width = 105, height = 42, inline = true, marginBottom = 0 }),
+    red = kingPage:AddText({ text = "", colour = KING_RED,
+        width = 105, height = 42, inline = true, marginBottom = 0 })
+}
+local function showKingTimer(text, colour)
+    for name, label in pairs(kingSpawnLabels) do
+        label.content = (name == colour) and text or ""
+    end
+end
+
+local kingStatusLabel = kingPage:AddText({
+    text = "Waiting for hard-mode wave 10"
+})
+
+kingPage:AddTitle("5 bucket 1st food drop:")
+local kingFoodLabel = kingPage:AddText({
+    text = "--",
+    height = 45
+})
+
+local function resetKing()
+    state.kingActive = false
+    state.kingStartTick = nil
+    state.kingSpawnDetected = false
+    state.kingFoodStartTick = nil
+    showKingTimer("06:00", "green")
+    kingFoodLabel.content = "--"
+    kingStatusLabel.content = "Waiting for hard-mode wave 10"
+end
+
+local function startKing()
+    if state.kingActive then return end
+    state.kingActive = true
+    state.kingStartTick = state.serverTick
+    state.kingSpawnDetected = false
+    state.kingFoodStartTick = nil
+    showKingTimer("06:00", "green")
+    kingFoodLabel.content = "--"
+    kingStatusLabel.content = "Waiting for Penance King"
+    print("BA Penance King: hard-mode wave 10 region entered")
+end
+
+-- PlayerList-style ByDistance API; only queried near expected spawn.
+local function kingNpcPresent()
+    local ok, npcs = pcall(function()
+        local self = PlayerList.Self()
+        if not self or not self.isValid then return nil end
+        return NPCList.ByDistance(self.coordGrid, 64)
+    end)
+    if not ok or not npcs then return false end
+
+    for _, npc in ipairs(npcs) do
+        if npc and npc.isValid ~= false then
+            -- Different API versions may expose the NPC type ID differently.
+            local found, npcId = pcall(function()
+                return npc.id or npc.npcId or npc.typeId or npc.typeID
+            end)
+            if found and tonumber(npcId) == KING_NPC_ID then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function updateKing()
+    if not state.kingActive then return end
+
+    local elapsed = math.max(0, state.serverTick - state.kingStartTick)
+    local remaining = math.max(0, KING_SPAWN_TICKS - elapsed)
+    local seconds = math.ceil(remaining * 0.6)
+    local colour = remaining <= 50 and "red"
+        or remaining <= 100 and "yellow" or "green"
+    showKingTimer(string.format("%02d:%02d",
+        math.floor(seconds / 60), seconds % 60), colour)
+
+    -- Poll only within five seconds of expected spawn.
+    -- Start the food timer immediately when the King is detected,
+    -- regardless of whether the spawn countdown has reached zero.
+    if not state.kingSpawnDetected and remaining < KING_POLL_BELOW_TICKS
+        and kingNpcPresent() then
+        state.kingSpawnDetected = true
+        state.kingFoodStartTick = state.serverTick
+        kingStatusLabel.content = "Penance King detected"
+    end
+
+    if state.kingFoodStartTick ~= nil then
+        local foodElapsed = state.serverTick - state.kingFoodStartTick
+        kingFoodLabel.content = tostring(math.max(0, KING_FOOD_TICKS - foodElapsed))
+    else
+        kingFoodLabel.content = "--"
+    end
+end
 
 -- ============================================
 -- Player Information UI
@@ -318,6 +461,7 @@ end
 -- ============================================
 
 local function resetRun()
+    resetKing()
     state.splits = { normal = {}, hard = {} }
     state.quickstarts = { normal = {}, hard = {} }
     state.inWave = false
@@ -340,6 +484,12 @@ local function startWaveFromRegion()
     local mode = modeValue == 0 and "normal"
         or modeValue == 1 and "hard" or nil
 
+    if mode == "hard" and waveValue == 10 then
+        updateGameState()
+        startKing()
+        return
+    end
+
     if not mode or type(waveValue) ~= "number"
         or waveValue < 1 or waveValue > 9 then
         print("BA RegionCreated: ignored (no valid BA mode/wave)")
@@ -361,10 +511,10 @@ local function startWaveFromRegion()
     if state.quickstartStartTick ~= nil
         and state.quickstartTargetWave == waveValue
         and state.quickstartMode == mode then
-        state.quickstarts[mode][waveValue] =
+        state.quickstarts[mode][waveValue - 1] =
             state.serverTick - state.quickstartStartTick
         print(string.format("BA quickstart: wave=%d ticks=%d",
-            waveValue, state.quickstarts[mode][waveValue]))
+            waveValue - 1, state.quickstarts[mode][waveValue - 1]))
     end
 
     state.quickstartStartTick = nil
@@ -395,6 +545,11 @@ updateGameState = function()
 
     if not newMode or type(waveValue) ~= "number" then
         return
+    end
+
+    -- Leaving hard wave 10 (including a run restart) cancels its timers.
+    if state.kingActive and (newMode ~= "hard" or waveValue ~= 10) then
+        resetKing()
     end
 
     if state.currentWave == nil then
@@ -468,6 +623,7 @@ Event.ServerLogic.Subscribe(
         state.serverTick = state.serverTick + 1
         -- Detect wave completion before advancing the display counter.
         updateGameState()
+        updateKing()
         if state.inWave then
             tickLabel.content = tostring(state.tick)
             state.tick = (state.tick + 1) % 10
@@ -492,6 +648,7 @@ Event.RegionCreated.Subscribe(
 -- ============================================
 
 refreshSplits()
+resetKing()
 updateGameState()
 updatePlayerInfo()
 
