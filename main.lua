@@ -272,7 +272,24 @@ local function pointString(value)
     if value == nil then
         return "--"
     end
-    return tostring(value)
+
+    local formatted = tostring(value)
+
+    -- Insert commas every 3 digits
+    while true do
+        local result, count = formatted:gsub(
+            "^(-?%d+)(%d%d%d)",
+            "%1,%2"
+        )
+
+        formatted = result
+
+        if count == 0 then
+            break
+        end
+    end
+
+    return formatted
 end
 
 local function formatPoints(a, d, c, h)
