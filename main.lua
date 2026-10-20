@@ -1,4 +1,8 @@
 
+-- ============================================
+-- BA Pal
+-- ============================================
+
 local parent = ui.Interfaces:GetComponent(
     id.Component.TOPLEVEL_V2__GAME_AREA
 )
@@ -8,9 +12,9 @@ local ba_app = prettyui.Window.new(parent, {
     x = 149,
     y = 336,
     width = 440,
-    height = 440,
+    height = 510,
     minWidth = 340,
-    minHeight = 300,
+    minHeight = 350,
     rowBackgroundColours = {
         0x24211EFF,
         0x2E2825FF
@@ -18,54 +22,48 @@ local ba_app = prettyui.Window.new(parent, {
     resizable = true
 })
 
--- =====================================
--- Varplayers
--- =====================================
+-- ============================================
+-- Variable access
+-- ============================================
 
 local function vp(id)
-    local config = var.VarPlayer.FromID(id)
-    return config and config.value or nil
+    local ok, value = pcall(function()
+        local config = var.VarPlayer.FromID(id)
+        return config and config.value or nil
+    end)
+    return ok and value or nil
 end
 
-local FLAGS_ID = 4689
-local TIMER_ID = 4690
-
-local waveFlags = {
-    normal = {
-        [2] = 0x2, [3] = 0x4,
-        [4] = 0x8, [5] = 0x10,
-        [6] = 0x20, [7] = 0x40,
-        [8] = 0x80, [9] = 0x100,
-        [10] = 0x200
-    },
-    hard = {
-        [1] = 0x400, [2] = 0x800,
-        [3] = 0x1000, [4] = 0x2000,
-        [5] = 0x4000, [6] = 0x8000,
-        [7] = 0x10000, [8] = 0x20000,
-        [9] = 0x40000, [10] = 0x80000
-    }
-}
-
-local function flagSet(value, mask)
-    return mask ~= nil and (value & mask) ~= 0
+local function vc(id)
+    local ok, value = pcall(function()
+        local config = var.VarClient.FromID(id)
+        return config and config.value or nil
+    end)
+    return ok and value or nil
 end
 
--- =====================================
--- State
--- =====================================
+local VAR = {
+    MODE = 4688,
+    WAVE = -22919,
+    ROUND_TIME = 4690,
+    ROLE = 1494,
 
-local tick = 0
-local selectedMode = "normal"
-local previousFlags = nil
-local previousTimer = nil
+    CURRENT_ATTACKER = -4519,
+    CURRENT_DEFENDER = -4527,
+    CURRENT_COLLECTOR = -4525,
+    CURRENT_HEALER = -4526,
 
-local splits = {
-    normal = {},
-    hard = {}
+    HIGHSCORE_ATTACKER = 1495,
+    HIGHSCORE_DEFENDER = 1496,
+    HIGHSCORE_COLLECTOR = 1497,
+    HIGHSCORE_HEALER = 1498
 }
 
-local roleNames = {
+local TEAM_NAME_IDS = {
+    2435, 2436, 2437, 2438, 2439
+}
+
+local ROLE_NAMES = {
     [0] = "No Role Set",
     [1] = "Attacker",
     [2] = "Defender",
@@ -73,9 +71,44 @@ local roleNames = {
     [4] = "Healer"
 }
 
--- =====================================
+-- ============================================
+-- Configuration
+-- ============================================
+
+-- Set to "previous" if the round timer resets
+-- on the same tick as the wave number changes.
+-- Set to "current" if the completed time is
+-- still available on the transition tick.
+local SPLIT_TIMER_SOURCE = "previous"
+
+-- Assumes 4690 represents game ticks.
+-- One RuneScape game tick is approximately 0.6s.
+-- Change to 1 if 4690 already represents seconds.
+local SECONDS_PER_TIMER_UNIT = 0.6
+
+-- ============================================
+-- Shared application state
+-- ============================================
+
+local state = {
+    tick = 0,
+
+    currentMode = nil,
+    currentWave = nil,
+
+    previousMode = nil,
+    previousWave = nil,
+    previousTimer = nil,
+
+    splits = {
+        normal = {},
+        hard = {}
+    }
+}
+
+-- ============================================
 -- Tabs
--- =====================================
+-- ============================================
 
 local tabs = ba_app:AddTabs({
     { text = "Wave Splits" },
@@ -88,27 +121,45 @@ local tabs = ba_app:AddTabs({
 local splitPage = tabs:GetPage(1)
 local tickPage = tabs:GetPage(2)
 
--- =====================================
--- Wave Splits page
--- =====================================
-
-splitPage:AddText("Display mode:")
+-- ============================================
+-- Wave Splits UI
+-- ============================================
 
 local modeLabel = splitPage:AddText({
-    text = "Normal",
+    text = "Mode: --",
     colour = 0xE8BD83FF
 })
 
-local rows = {}
+local waveLabel = splitPage:AddText({
+    text = "Current Wave: --"
+})
 
-local function formatTime(value)
-    if value == nil then
+splitPage:AddText({
+    text = "WAVE          TIME",
+    colour = 0xE8BD83FF
+})
+
+local splitRows = {}
+
+for wave = 1, 9 do
+    splitRows[wave] = splitPage:AddText({
+        text = string.format(
+            "Wave %d     --:--",
+            wave
+        ),
+        height = 20
+    })
+end
+
+local function formatTime(raw)
+    if raw == nil then
         return "--:--"
     end
 
-    -- Assumes value is seconds.
-    -- Adjust after verifying timer units.
-    local seconds = math.floor(value)
+    local seconds = math.floor(
+        raw * SECONDS_PER_TIMER_UNIT
+    )
+
     return string.format(
         "%02d:%02d",
         math.floor(seconds / 60),
@@ -117,41 +168,35 @@ local function formatTime(value)
 end
 
 local function refreshSplits()
+    local mode = state.currentMode
+
     modeLabel.content =
-        selectedMode == "hard" and "Hard" or "Normal"
+        "Mode: " .. (
+            mode == "hard" and "Hard"
+            or mode == "normal" and "Normal"
+            or "--"
+        )
+
+    waveLabel.content =
+        "Current Wave: " ..
+        tostring(state.currentWave or "--")
 
     for wave = 1, 9 do
-        local value = splits[selectedMode][wave]
+        local time = mode
+            and state.splits[mode][wave]
+            or nil
 
-        rows[wave].content = string.format(
+        splitRows[wave].content = string.format(
             "Wave %d     %s",
             wave,
-            formatTime(value)
+            formatTime(time)
         )
     end
 end
 
-splitPage:AddSimpleButton("Normal / Hard", function()
-    selectedMode =
-        selectedMode == "normal" and "hard" or "normal"
-    refreshSplits()
-end)
-
-splitPage:AddText({
-    text = "WAVE          TIME",
-    colour = 0xE8BD83FF
-})
-
-for wave = 1, 9 do
-    rows[wave] = splitPage:AddText({
-        text = string.format("Wave %d     --:--", wave),
-        height = 20
-    })
-end
-
--- =====================================
--- Wave Tick page
--- =====================================
+-- ============================================
+-- Wave Tick UI
+-- ============================================
 
 tickPage:AddTitle("Current Tick")
 
@@ -167,9 +212,17 @@ local timerLabel = tickPage:AddText({
     text = "Round timer: --"
 })
 
--- =====================================
--- Player information footer
--- =====================================
+local tickWaveLabel = tickPage:AddText({
+    text = "Wave: --"
+})
+
+local tickModeLabel = tickPage:AddText({
+    text = "Mode: --"
+})
+
+-- ============================================
+-- Player Information UI
+-- ============================================
 
 ba_app:AddText({
     text = "PLAYER INFORMATION",
@@ -177,122 +230,248 @@ ba_app:AddText({
     marginTop = 8
 })
 
-local roleLabel = ba_app:AddText("Role: --")
+local roleLabel = ba_app:AddText({
+    text = "Role: --"
+})
 
-local pointsLabel = ba_app:AddText({
-    text = "Points: --",
+ba_app:AddText({
+    text = "Current Points",
+    colour = 0xE8BD83FF
+})
+
+local currentPointsLabel = ba_app:AddText({
+    text = "A: --  D: --  C: --  H: --",
     height = 24
+})
+
+ba_app:AddText({
+    text = "Highscore Points",
+    colour = 0xE8BD83FF
+})
+
+local highscorePointsLabel = ba_app:AddText({
+    text = "A: --  D: --  C: --  H: --",
+    height = 24
+})
+
+ba_app:AddText({
+    text = "Team",
+    colour = 0xE8BD83FF
 })
 
 local teammatesLabel = ba_app:AddText({
     text = "Teammates: --",
-    height = 24
+    height = 40
 })
 
--- =====================================
--- Player info updates
--- =====================================
+-- ============================================
+-- Player Information Updates
+-- ============================================
 
-local function updatePlayerInfo()
-    local role = vp(1494)
-
-    roleLabel.content =
-        "Role: " .. (roleNames[role] or tostring(role or "--"))
-
-    local attacker = vp(1495)
-    local defender = vp(1496)
-    local collector = vp(1497)
-    local healer = vp(1498)
-
-    pointsLabel.content = string.format(
-        "A: %s  D: %s  C: %s  H: %s",
-        tostring(attacker or "--"),
-        tostring(defender or "--"),
-        tostring(collector or "--"),
-        tostring(healer or "--")
-    )
-
-    local teammates = {}
-
-    for id = 1499, 1502 do
-        local uid = vp(id)
-        if uid ~= nil and uid ~= 0 then
-            teammates[#teammates + 1] = tostring(uid)
-        end
+local function pointString(value)
+    if value == nil then
+        return "--"
     end
-
-    teammatesLabel.content =
-        "Teammates: " .. (
-            #teammates > 0
-            and table.concat(teammates, ", ")
-            or "--"
-        )
+    return tostring(value)
 end
 
--- =====================================
--- Wave flag tracking
--- =====================================
+local function formatPoints(a, d, c, h)
+    return string.format(
+        "A: %s  D: %s  C: %s  H: %s",
+        pointString(a),
+        pointString(d),
+        pointString(c),
+        pointString(h)
+    )
+end
 
-local function updateWaves()
-    local flags = vp(FLAGS_ID)
-    local timer = vp(TIMER_ID)
+local function updatePlayerInfo()
+    local role = vp(VAR.ROLE)
 
-    if flags == nil or timer == nil then
-        return
-    end
+    roleLabel.content =
+        "Role: " .. (
+            ROLE_NAMES[role]
+            or tostring(role or "--")
+        )
 
-    timerLabel.content =
-        "Round timer (raw): " .. tostring(timer)
+    currentPointsLabel.content = formatPoints(
+        vp(VAR.CURRENT_ATTACKER),
+        vp(VAR.CURRENT_DEFENDER),
+        vp(VAR.CURRENT_COLLECTOR),
+        vp(VAR.CURRENT_HEALER)
+    )
 
-    if previousFlags ~= nil then
-        for _, mode in ipairs({ "normal", "hard" }) do
-            for wave = 1, 9 do
-                local mask = waveFlags[mode][wave]
+    highscorePointsLabel.content = formatPoints(
+        vp(VAR.HIGHSCORE_ATTACKER),
+        vp(VAR.HIGHSCORE_DEFENDER),
+        vp(VAR.HIGHSCORE_COLLECTOR),
+        vp(VAR.HIGHSCORE_HEALER)
+    )
 
-                if mask then
-                    local wasSet = flagSet(previousFlags, mask)
-                    local isSet = flagSet(flags, mask)
+    local names = {}
+    local seen = {}
 
-                    if isSet and not wasSet then
-                        -- A wave flag has transitioned.
-                        --
-                        -- Do not assign a split yet:
-                        -- 4690 timer semantics and
-                        -- flag timing must be verified.
-                        --
-                        -- Debug logging:
-                        log(string.format(
-                            "BA wave flag: mode=%s wave=%d timer=%s",
-                            mode, wave, tostring(timer)
-                        ))
-                    end
-                end
+    for _, id in ipairs(TEAM_NAME_IDS) do
+        local name = vc(id)
+
+        if type(name) == "string" then
+            name = name:match("^%s*(.-)%s*$")
+
+            if name ~= "" and not seen[name] then
+                names[#names + 1] = name
+                seen[name] = true
             end
         end
     end
 
-    previousFlags = flags
-    previousTimer = timer
+    teammatesLabel.content =
+        "Team: " .. (
+            #names > 0
+            and table.concat(names, ", ")
+            or "--"
+        )
 end
 
--- =====================================
--- Server tick
--- =====================================
+-- ============================================
+-- Game State / Wave Tracking
+-- ============================================
 
-Event.ServerLogic.Subscribe("serverLogicEvent", function()
-    tickLabel.content = tostring(tick)
-    tick = (tick + 1) % 10
+local function updateGameState()
+    local modeValue = vp(VAR.MODE)
+    local waveValue = vp(VAR.WAVE)
+    local timerValue = vp(VAR.ROUND_TIME)
 
-    updateWaves()
-    updatePlayerInfo()
-end)
+    -- Update raw timer independently.
+    timerLabel.content =
+        "Round timer (raw): " ..
+        tostring(timerValue or "--")
+
+    if modeValue == nil or waveValue == nil then
+        return
+    end
+
+    local newMode = nil
+
+    if modeValue == 0 then
+        newMode = "normal"
+    elseif modeValue == 1 then
+        newMode = "hard"
+    end
+
+    if newMode == nil then
+        return
+    end
+
+    local modeChanged =
+        newMode ~= state.currentMode
+
+    local waveChanged =
+        waveValue ~= state.currentWave
+
+    -- Initial observation: do not record a split.
+    if state.currentWave == nil then
+        state.currentMode = newMode
+        state.currentWave = waveValue
+        state.previousTimer = timerValue
+
+        refreshSplits()
+        return
+    end
+
+    -- Detect wave transitions.
+    if waveChanged then
+        local oldWave = state.currentWave
+        local oldMode = state.currentMode
+
+        print(string.format(
+            "BA wave transition: %s -> %s",
+            tostring(oldWave),
+            tostring(waveValue)
+        ))
+
+        -- A sequential increment is a candidate
+        -- completed-wave event.
+        --
+        -- Note: ticket skips may also increment
+        -- the wave number, so this needs validation.
+        if waveValue == oldWave + 1
+            and oldWave >= 1
+            and oldWave <= 9
+            and oldMode == newMode then
+
+            local completedTime = nil
+
+            if SPLIT_TIMER_SOURCE == "previous" then
+                completedTime = state.previousTimer
+            else
+                completedTime = timerValue
+            end
+
+            if completedTime ~= nil then
+                state.splits[oldMode][oldWave] =
+                    completedTime
+
+                print(string.format(
+                    "BA split: mode=%s wave=%d time=%s",
+                    oldMode,
+                    oldWave,
+                    tostring(completedTime)
+                ))
+            end
+        end
+    end
+
+    state.currentMode = newMode
+    state.currentWave = waveValue
+    state.previousTimer = timerValue
+
+    if modeChanged or waveChanged then
+        refreshSplits()
+    end
+
+    tickWaveLabel.content =
+        "Wave: " .. tostring(waveValue)
+
+    tickModeLabel.content =
+        "Mode: " .. (
+            newMode == "hard" and "Hard"
+            or "Normal"
+        )
+end
+
+-- ============================================
+-- Server Tick
+-- ============================================
+
+Event.ServerLogic.Subscribe(
+    "serverLogicEvent",
+    function()
+        tickLabel.content = tostring(state.tick)
+        state.tick = (state.tick + 1) % 10
+
+        updateGameState()
+        updatePlayerInfo()
+    end
+)
+
+-- ============================================
+-- Initialization
+-- ============================================
 
 refreshSplits()
+updateGameState()
 updatePlayerInfo()
+
 ba_app:RefreshRowBackgrounds()
 
--- Merge with any existing shutdown function.
+-- ============================================
+-- Shutdown
+-- ============================================
+
 function PluginShutdown()
-    Event.ServerLogic.Unsubscribe("serverLogicEvent")
+    Event.ServerLogic.Unsubscribe(
+        "serverLogicEvent"
+    )
+
     ba_app:Destroy()
 end
