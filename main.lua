@@ -314,7 +314,7 @@ local kingFoodLabel = kingPage:AddText({
 })
 
 kingPage:AddTitle("Stored BA kills")
-local kingKillsLabel = kingPage:AddText({ text = "King kills: -- / 20" })
+local kingKillsLabel = kingPage:AddText({ text = "King kills: -- / 50" })
 local queenKillsLabel = kingPage:AddText({ text = "Queen kills: -- / 1" })
 
 local function updateStoredKills()
@@ -690,6 +690,7 @@ Event.ServerLogic.Subscribe(
         --DEBUG
         print('BARBASSAULT_COLLECTOR_USED ' .. vp(4683))
         print('BARBASSAULT_KING_PLAYER ' .. vp(4684))
+
 
         if state.inWave then
             tickLabel.content = tostring(state.tick)
