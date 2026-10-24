@@ -34,13 +34,23 @@ local function vp(id)
     return ok and value or nil
 end
 
+local function vc(id)
+    local ok, value = pcall(function()
+        local config = var.VarClient.FromID(id)
+        return config and config.value or nil
+    end)
+    return ok and value or nil
+end
+
 local VAR = {
     MODE = 4688,
-    WAVE = -22919,
+    WAVE_HINT = -22919, -- ticket/lobby hint only; not wave-completion signal
+    GAMEAREA_MASTER = 1776,
     ROUND_TIME = 4690,
     ROLE = 1494,
     KING_KILL_CURRENCY = -22920,
-    QUEEN_KILL_CURRENCY = -4509,
+    QUEEN_TICKET_BLOCK = 4840, -- change heuristic only
+    QUEEN_KILLED = -4509, -- observe changes for a queen kill
     REWARD_TYPE = -4537,
 
     CURRENT_ATTACKER = -4519,
@@ -90,8 +100,13 @@ local state = {
     currentMode = nil,
     currentWave = nil,
     previousTimer = nil,
+    lastGamearea = nil,
+    gameareaChanges = 0,
+    waveCounter = 0,
+    lastCallValue = nil,
+    lastCallTick = nil,
 
-    -- Only a RegionCreated event starts an active wave.
+    -- GAMEAREA_MASTER transitions toggle ordinary waves; startup can seed via IsRegion.
     inWave = false,
     activeWave = nil,
     activeMode = nil,
@@ -107,7 +122,10 @@ local state = {
     kingActive = false,
     kingStartTick = nil,
     kingSpawnDetected = false,
-    kingFoodStartTick = nil
+    kingFoodStartTick = nil,
+    queenStored = nil,
+    lastQueenBlock = nil,
+    lastQueenKilled = nil
 }
 
 -- ============================================
@@ -249,15 +267,30 @@ local callChangeLabel = tickPage:AddText({
 local CALL_CHANGE_TICKS = 50
 local SECONDS_PER_GAME_TICK = 0.6
 
+-- BARBASSAULT3's numeric ID was not supplied. Prefer the named
+-- config when available; set BARBASSAULT3_ID below if needed.
+local BARBASSAULT3_ID = nil
+local function readCallVariable()
+    if BARBASSAULT3_ID then return vp(BARBASSAULT3_ID) end
+    local ok, value = pcall(function()
+        local config = var.Player.BARBASSAULT3
+        return config and config.value or nil
+    end)
+    return ok and value or nil
+end
+
 local function updateWaveTimers()
     if state.inWave and state.waveStartTick ~= nil then
         local elapsed = math.max(0, state.serverTick - state.waveStartTick)
         state.waveElapsedTicks = elapsed
         timerLabel.content = "Wave time (ticks): " .. tostring(elapsed)
-
-        local remainingTicks = CALL_CHANGE_TICKS - (elapsed % CALL_CHANGE_TICKS)
-        local remainingSeconds = remainingTicks * SECONDS_PER_GAME_TICK
-        callChangeLabel.content = string.format("Call change in: %.1fs", remainingSeconds)
+        if state.lastCallTick ~= nil then
+            local sinceCall = math.max(0, state.serverTick - state.lastCallTick)
+            local remain = math.max(0, CALL_CHANGE_TICKS - sinceCall)
+            callChangeLabel.content = string.format("Call change in: %.1fs", remain * SECONDS_PER_GAME_TICK)
+        else
+            callChangeLabel.content = "Call change in: -- (awaiting BARBASSAULT3)"
+        end
     else
         timerLabel.content = "Wave time (ticks): " ..
             tostring(state.waveElapsedTicks ~= nil and state.waveElapsedTicks or "--")
@@ -277,10 +310,8 @@ local tickModeLabel = tickPage:AddText({
 -- Penance King UI and timing
 -- ============================================
 
-local KING_NPC_ID = 19670
 local KING_SPAWN_TICKS = 600  -- 6 minutes at 600 ms per server tick
 local KING_FOOD_TICKS = 36
-local KING_POLL_BELOW_TICKS = 9 -- strictly below 5 seconds
 local KING_GREEN = 0x44DD66FF
 local KING_YELLOW = 0xFFE04AFF
 local KING_RED = 0xFF5555FF
@@ -319,9 +350,30 @@ local queenKillsLabel = kingPage:AddText({ text = "Queen kills: -- / 1" })
 
 local function updateStoredKills()
     local kingKills = vp(VAR.KING_KILL_CURRENCY)
-    local queenKills = vp(VAR.QUEEN_KILL_CURRENCY)
-    kingKillsLabel.content = "King kills: " .. tostring(kingKills ~= nil and kingKills or "--") .. " / 20"
-    queenKillsLabel.content = "Queen kills: " .. tostring(queenKills ~= nil and queenKills or "--") .. " / 1"
+    local queenBlock = vp(VAR.QUEEN_TICKET_BLOCK)
+    local queenKilled = vp(VAR.QUEEN_KILLED)
+
+    -- Heuristic: a change in the queen-killed flag indicates a new kill;
+    -- a change in ticket block indicates a possible redemption.
+    -- Prioritize kill if both change in the same server tick.
+    local blockChanged = queenBlock ~= nil and state.lastQueenBlock ~= nil
+        and queenBlock ~= state.lastQueenBlock
+    local killChanged = queenKilled ~= nil and state.lastQueenKilled ~= nil
+        and queenKilled ~= state.lastQueenKilled
+    if blockChanged then
+        state.queenStored = 0
+        print("BA queen ticket block changed: " .. tostring(state.lastQueenBlock)
+            .. " -> " .. tostring(queenBlock))
+    end
+    if killChanged then
+        state.queenStored = 1
+        print("BA queen killed flag changed: " .. tostring(state.lastQueenKilled)
+            .. " -> " .. tostring(queenKilled))
+    end
+    if queenBlock ~= nil then state.lastQueenBlock = queenBlock end
+    if queenKilled ~= nil then state.lastQueenKilled = queenKilled end
+    kingKillsLabel.content = "King kills: " .. tostring(kingKills ~= nil and kingKills or "--") .. " / 50"
+    queenKillsLabel.content = "Queen kills: " .. tostring(state.queenStored ~= nil and state.queenStored or "--") .. " / 1"
 end
 
 local function resetKing()
@@ -346,29 +398,6 @@ local function startKing()
     print("BA Penance King: hard-mode wave 10 region entered")
 end
 
--- PlayerList-style ByDistance API; only queried near expected spawn.
-local function kingNpcPresent()
-    local ok, npcs = pcall(function()
-        local self = PlayerList.Self()
-        if not self or not self.isValid then return nil end
-        return NPCList.ByDistance(self.coordGrid, 64)
-    end)
-    if not ok or not npcs then return false end
-
-    for _, npc in ipairs(npcs) do
-        if npc and npc.isValid ~= false then
-            -- Different API versions may expose the NPC type ID differently.
-            local found, npcId = pcall(function()
-                return npc.id or npc.npcId or npc.typeId or npc.typeID
-            end)
-            if found and tonumber(npcId) == KING_NPC_ID then
-                return true
-            end
-        end
-    end
-    return false
-end
-
 local function updateKing()
     if not state.kingActive then return end
 
@@ -380,16 +409,7 @@ local function updateKing()
     showKingTimer(string.format("%02d:%02d",
         math.floor(seconds / 60), seconds % 60), colour)
 
-    -- Poll only within five seconds of expected spawn.
-    -- Start the food timer immediately when the King is detected,
-    -- regardless of whether the spawn countdown has reached zero.
-    if not state.kingSpawnDetected and remaining < KING_POLL_BELOW_TICKS
-        and kingNpcPresent() then
-        state.kingSpawnDetected = true
-        state.kingFoodStartTick = state.serverTick
-        kingStatusLabel.content = "Penance King detected"
-    end
-
+    -- The 36-tick timer is started exclusively by the King chat announcement.
     if state.kingFoodStartTick ~= nil then
         local foodElapsed = state.serverTick - state.kingFoodStartTick
         kingFoodLabel.content = tostring(math.max(0, KING_FOOD_TICKS - foodElapsed))
@@ -435,6 +455,15 @@ local highscorePointsLabel = ba_app:AddText({
     text = "A: --  D: --  C: --  H: --",
     height = 24
 })
+
+ba_app:AddText({ text = "TEAMMATES", colour = 0xE8BD83FF, marginTop = 8 })
+local teamLabels = {}
+for slot = 1, 5 do
+    teamLabels[slot] = ba_app:AddText({
+        text = string.format("%d. --", slot), height = 21,
+        marginTop = 0, marginBottom = 0
+    })
+end
 
 -- ============================================
 -- Player Information Updates
@@ -504,6 +533,13 @@ local function updatePlayerInfo()
         vp(VAR.HIGHSCORE_HEALER)
     )
 
+    for slot = 1, 5 do
+        local value = vc(2434 + slot)
+        local name = type(value) == "string" and value:match("^%s*(.-)%s*$") or nil
+        teamLabels[slot].content = string.format("%d. %s", slot,
+            name and name ~= "" and name or "--")
+    end
+
 
 end
 
@@ -515,162 +551,142 @@ local function resetRun()
     resetKing()
     state.splits = { normal = {}, hard = {} }
     state.quickstarts = { normal = {}, hard = {} }
+    state.waveCounter = 0
     state.inWave = false
     state.activeWave = nil
     state.activeMode = nil
     state.tick = 0
     state.waveStartTick = nil
     state.waveElapsedTicks = nil
-    updateWaveTimers()
+    state.lastCallTick = nil
+    state.lastCallValue = nil
     state.quickstartStartTick = nil
     state.quickstartTargetWave = nil
     state.quickstartMode = nil
     tickLabel.content = "--"
     tickStatusLabel.content = "Status: Waiting for wave"
+    updateWaveTimers()
 end
 
-local updateGameState -- Forward declaration for RegionCreated callback
+local function modeNow()
+    local v = vp(VAR.MODE)
+    return v == 1 and "hard" or v == 0 and "normal" or nil
+end
 
--- Called by RegionCreated; this is the ONLY way to start a wave.
-local function startWaveFromRegion()
-    local modeValue = vp(VAR.MODE)
-    local waveValue = vp(VAR.WAVE)
-    local mode = modeValue == 0 and "normal"
-        or modeValue == 1 and "hard" or nil
-
-    if mode == "hard" and waveValue == 10 then
-        updateGameState()
-        startKing()
-        return
+local function startWave()
+    if state.inWave then return end
+    local mode = modeNow()
+    if not mode then return end
+    -- Wave numbers 1-9 are inferred from sequential starts; the old
+    -- -22919 variable is not used to decide whether a wave ended.
+    local wave = state.waveCounter + 1
+    if wave > 9 then
+        resetRun()
+        wave = 1
     end
-
-    if not mode or type(waveValue) ~= "number"
-        or waveValue < 1 or waveValue > 9 then
-        print("BA RegionCreated: ignored (no valid BA mode/wave)")
-        return
-    end
-
-    -- Reconcile any wave transition not yet observed by ServerLogic.
-    updateGameState()
-
+    state.waveCounter = wave
+    state.currentWave = wave
     state.currentMode = mode
-    state.currentWave = waveValue
-
-    -- Avoid restarting the tick counter on repeated region events.
-    if state.inWave then
-        print("BA RegionCreated: already in wave; ignored")
-        return
-    end
-
-    if state.quickstartStartTick ~= nil
-        and state.quickstartTargetWave == waveValue
-        and state.quickstartMode == mode then
-        state.quickstarts[mode][waveValue - 1] =
+    if state.quickstartStartTick and wave > 1 then
+        state.quickstarts[mode][wave - 1] =
             state.serverTick - state.quickstartStartTick
-        print(string.format("BA quickstart: wave=%d ticks=%d",
-            waveValue - 1, state.quickstarts[mode][waveValue - 1]))
     end
-
     state.quickstartStartTick = nil
-    state.quickstartTargetWave = nil
-    state.quickstartMode = nil
     state.inWave = true
-    state.activeWave = waveValue
+    state.activeWave = wave
     state.activeMode = mode
     state.tick = 0
     state.waveStartTick = state.serverTick
     state.waveElapsedTicks = 0
-    updateWaveTimers()
+    state.lastCallValue = readCallVariable()
+    state.lastCallTick = state.lastCallValue ~= nil and state.serverTick or nil
     tickLabel.content = "0"
     tickStatusLabel.content = "Status: In wave"
+    updateWaveTimers()
+    refreshSplits()
+    print("BA wave START from GAMEAREA_MASTER: " .. tostring(wave))
+end
 
-    print(string.format("BA wave started (RegionCreated): %s wave %d",
-        mode, waveValue))
+local function endWave()
+    if not state.inWave then return end
+    local elapsed = math.max(0, state.serverTick - state.waveStartTick)
+    state.waveElapsedTicks = elapsed
+    if state.activeWave and state.activeWave <= 9 then
+        state.splits[state.activeMode][state.activeWave] = elapsed
+    end
+    state.inWave = false
+    state.waveStartTick = nil
+    state.lastCallTick = nil
+    state.lastCallValue = nil
+    state.quickstartStartTick = state.serverTick
+    state.activeWave = nil
+    state.activeMode = nil
+    state.tick = 0
+    tickLabel.content = "--"
+    tickStatusLabel.content = "Status: Between waves"
+    updateWaveTimers()
+    refreshSplits()
+    print("BA wave END from GAMEAREA_MASTER")
+end
+
+local function updateGameState()
+    local mode = modeNow()
+    local gamearea = vp(VAR.GAMEAREA_MASTER)
+    local hint = vp(VAR.WAVE_HINT)
+    tickModeLabel.content = "Mode: " .. (mode == "hard" and "Hard" or mode == "normal" and "Normal" or "--")
+    tickWaveLabel.content = "Wave (inferred): " .. tostring(state.currentWave or "--")
+    if mode then state.currentMode = mode end
+    -- First read establishes the baseline. If loaded mid-instance,
+    -- seed active state so the next 1776 change correctly ends the wave.
+    if state.lastGamearea == nil and gamearea ~= nil then
+        local ok, inRegion = pcall(function() return World.IsRegion() end)
+        if ok and inRegion and mode then
+            if mode == "hard" and hint == 10 then
+                startKing()
+            else
+                startWave()
+                print("BA startup: initialized active wave from World.IsRegion()")
+            end
+        end
+    end
+    if gamearea ~= nil then
+        if state.lastGamearea ~= nil and gamearea ~= state.lastGamearea then
+            state.gameareaChanges = state.gameareaChanges + 1
+            print("GAMEAREA_MASTER: " .. tostring(state.lastGamearea) .. " -> " .. tostring(gamearea))
+            -- Until we identify the precise entry/exit values, toggle on
+            -- each transition. See the calibration note in the response.
+            if state.inWave then
+                endWave()
+            elseif state.kingActive then
+                resetKing()
+            elseif mode and not (mode == "hard" and hint == 10) then
+                startWave()
+            end
+        end
+        state.lastGamearea = gamearea
+    end
+    -- Call changes are observed independently of wave boundaries.
+    if state.inWave then
+        local callValue = readCallVariable()
+        if callValue ~= nil then
+            if state.lastCallValue ~= nil and callValue ~= state.lastCallValue then
+                state.lastCallTick = state.serverTick
+                print("BA call changed: " .. tostring(state.lastCallValue) .. " -> " .. tostring(callValue))
+            elseif state.lastCallValue == nil then
+                state.lastCallTick = state.serverTick
+            end
+            state.lastCallValue = callValue
+        end
+    end
     refreshSplits()
 end
 
-updateGameState = function()
-    local modeValue = vp(VAR.MODE)
-    local waveValue = vp(VAR.WAVE)
-    local timerValue = vp(VAR.ROUND_TIME)
-
-    local newMode = modeValue == 0 and "normal"
-        or modeValue == 1 and "hard" or nil
-
-    if not newMode or type(waveValue) ~= "number" then
-        return
+-- RegionCreated remains useful for the confirmed hard-mode King entry.
+local function startWaveFromRegion()
+    if modeNow() == "hard" and vp(VAR.WAVE_HINT) == 10 then
+        if state.inWave then endWave() end
+        startKing()
     end
-
-    -- Leaving hard wave 10 (including a run restart) cancels its timers.
-    if state.kingActive and (newMode ~= "hard" or waveValue ~= 10) then
-        resetKing()
-    end
-
-    if state.currentWave == nil then
-        state.currentMode = newMode
-        state.currentWave = waveValue
-        state.previousTimer = timerValue
-        refreshSplits()
-    else
-        local oldWave = state.currentWave
-        local oldMode = state.currentMode
-
-        if waveValue < oldWave or newMode ~= oldMode then
-            print(string.format("BA run reset: %s wave %s -> %s wave %s",
-                tostring(oldMode), tostring(oldWave), newMode,
-                tostring(waveValue)))
-            resetRun()
-        elseif waveValue > oldWave then
-            print(string.format("BA wave transition: %d -> %d",
-                oldWave, waveValue))
-
-            -- Only record a split if RegionCreated actually started
-            -- the completed wave, and this is a sequential increment.
-            if state.inWave and state.activeWave == oldWave
-                and state.activeMode == oldMode
-                and waveValue == oldWave + 1 then
-                local completedTime = SPLIT_TIMER_SOURCE == "previous"
-                    and state.previousTimer or timerValue
-                if completedTime ~= nil then
-                    state.splits[oldMode][oldWave] = completedTime
-                    print(string.format("BA split: %s wave=%d time=%s",
-                        oldMode, oldWave, tostring(completedTime)))
-                end
-
-                -- The next wave's quickstart begins NOW, at increment.
-                state.quickstartStartTick = state.serverTick
-                state.quickstartTargetWave = waveValue
-                state.quickstartMode = newMode
-            else
-                -- Skip / missed start: no trustworthy quickstart origin.
-                state.quickstartStartTick = nil
-                state.quickstartTargetWave = nil
-                state.quickstartMode = nil
-            end
-
-            -- Freeze the completed wave's elapsed time until the next entry.
-            if state.waveStartTick ~= nil then
-                state.waveElapsedTicks = math.max(0, state.serverTick - state.waveStartTick)
-            end
-            state.waveStartTick = nil
-            state.inWave = false
-            updateWaveTimers()
-            state.activeWave = nil
-            state.activeMode = nil
-            state.tick = 0
-            tickLabel.content = "--"
-            tickStatusLabel.content = "Status: Between waves"
-        end
-
-        state.currentMode = newMode
-        state.currentWave = waveValue
-        refreshSplits()
-    end
-
-    state.previousTimer = timerValue
-    tickWaveLabel.content = "Wave: " .. tostring(waveValue)
-    tickModeLabel.content = "Mode: " ..
-        (newMode == "hard" and "Hard" or "Normal")
 end
 
 -- ============================================
@@ -686,11 +702,6 @@ Event.ServerLogic.Subscribe(
         updateKing()
         updateWaveTimers()
         updateStoredKills()
-
-        --DEBUG
-        print('BARBASSAULT_COLLECTOR_USED ' .. vp(4683))
-        print('BARBASSAULT_KING_PLAYER ' .. vp(4684))
-
 
         if state.inWave then
             tickLabel.content = tostring(state.tick)
@@ -710,6 +721,25 @@ Event.RegionCreated.Subscribe(
         startWaveFromRegion()
     end
 )
+
+-- Requires chatAccess permission in the plugin manifest.
+-- Match the actual in-game announcement text if it differs.
+local chatSubscribed = pcall(function()
+    Event.ChatMessage.Subscribe("baKingAnnouncement", function(event)
+        if not state.kingActive or state.kingSpawnDetected then return end
+        local msg = tostring(event.chatMessage or "")
+        local plain = msg:gsub("<[^>]*>", ""):lower()
+        if plain:find("penance king", 1, true)
+            and (plain:find("appear", 1, true)
+                or plain:find("spawn", 1, true)
+                or plain:find("emerge", 1, true)) then
+            state.kingSpawnDetected = true
+            state.kingFoodStartTick = state.serverTick
+            kingStatusLabel.content = "King announcement detected"
+            print("BA King food timer started by chat: " .. plain)
+        end
+    end)
+end)
 
 -- ============================================
 -- Initialization
@@ -737,5 +767,8 @@ function PluginShutdown()
         "baRegionCreated"
     )
 
+    if chatSubscribed then
+        pcall(function() Event.ChatMessage.Unsubscribe("baKingAnnouncement") end)
+    end
     ba_app:Destroy()
 end
